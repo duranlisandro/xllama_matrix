@@ -352,7 +352,12 @@ JSON
 		fi
 		verdict=1
 	fi
-	[[ $uploaded -eq 1 ]] && serve_cleanup "$saved_manifest"
+	if [[ $uploaded -eq 1 ]]; then
+		serve_cleanup "$saved_manifest" || {
+			echo "  FAIL: cleanup incomplete; model.gguf, .complete and manifest.json override may remain on the device" >&2
+			verdict=1
+		}
+	fi
 	[[ $verdict -eq 0 ]] && echo "Training serve: PASS" || echo "Training serve: FAIL"
 	return $verdict
 }

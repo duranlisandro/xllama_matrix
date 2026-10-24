@@ -265,5 +265,112 @@ exit 0
         self.assertNotIn(CID + '.json', files)
 
 
+class TrainingServeCleanupTests(unittest.TestCase):
+    def run_serve(self, stop_fail=False, autopilot_fail=False, skip_upload=False,
+                  log_fail=False):
+        """Run the actual serve gate and cleanup against local device fixtures."""
+        text = (ROOT / 'scripts/validate-console-training.sh').read_text()
+        functions = []
+        for name in ('serve_cleanup', 'validate_serve'):
+            start = text.index(name + '() {')
+            functions.append(text[start:text.index('\n}\n', start) + 3])
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            remote = base / 'remote'
+            remote.mkdir()
+            (base / 'merged.gguf').write_text('test model')
+            (remote / 'manifest.json').write_text('{"models": ["user-model"]}')
+            env = dict(os.environ, TMPDIR_LOCAL=tmp, REMOTE=str(remote),
+                       STOP_FAIL=str(int(stop_fail)), AP_FAIL=str(int(autopilot_fail)),
+                       SKIP_UPLOAD=str(int(skip_upload)), LOG_FAIL=str(int(log_fail)))
+            setup = r'''
+set -euo pipefail
+MERGED="$TMPDIR_LOCAL/merged.gguf"
+REPO_ROOT="$TMPDIR_LOCAL"
+DEPLOY=true
+PFN=test-package
+PINNED_SETTINGS=''
+prepare_merged_q4() { :; }
+stop_app() {
+    if [[ "$STOP_FAIL" == 1 ]]; then
+        echo 'original stop error' >&2
+        return 17
+    fi
+}
+upload_file() {
+    if [[ "${3:-}" == manifest.json && "$1" != *manifest-saved.json ]]; then
+        printf 'fixture override' >"$REMOTE/manifest.json"
+    else
+        cp "$1" "$REMOTE/${3:-$(basename "$1")}"
+    fi
+}
+delete_file() { rm -f "$REMOTE/$1"; }
+fetch_file() { cp "$REMOTE/$1" "$2"; }
+list_chat_ids() { [[ ! -f "$REMOTE/current.json" ]] || echo current; }
+run_autopilot() {
+    cat >/dev/null
+    printf '{"messages":[{"content":"xllama secret XLLAMA-LORA-OK"}]}' >"$REMOTE/current.json"
+    printf 'GGUF model loaded via llama.cpp\nsession generate: n=1\n' >"$TMPDIR_LOCAL/current.log"
+    [[ "$AP_FAIL" == 0 ]] && echo ok || echo 'error: inference failed'
+}
+fetch_log() {
+    [[ "$LOG_FAIL" == 0 ]] || { echo 'original log error' >&2; return 9; }
+    echo "$TMPDIR_LOCAL/current.log"
+}
+'''
+            # Keep the same conditional call as the CLI: errexit is disabled
+            # within validate_serve, so cleanup must explicitly affect verdict.
+            result = subprocess.run(
+                ['bash', '-c', setup + '\n' + '\n'.join(functions) +
+                 '\nrc=0\nvalidate_serve || rc=1\nexit "$rc"'],
+                env=env, capture_output=True, text=True, timeout=25)
+            files = {p.name: p.read_bytes() for p in remote.iterdir()}
+            return result, files
+
+    def test_success_requires_cleanup(self):
+        result, files = self.run_serve()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Training serve: PASS', result.stdout)
+        self.assertNotIn('model.gguf', files)
+        self.assertNotIn('.complete', files)
+        self.assertEqual(files['manifest.json'], b'{"models": ["user-model"]}')
+
+    def test_failed_cleanup_rejects_otherwise_valid_serve(self):
+        result, files = self.run_serve(stop_fail=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('Training serve: PASS', result.stdout)
+        self.assertIn('Training serve: FAIL', result.stdout)
+        self.assertIn('original stop error', result.stderr)
+        for name in ('model.gguf', '.complete', 'manifest.json'):
+            self.assertIn(name, result.stderr)
+            self.assertIn(name, files)
+        self.assertEqual(files['manifest.json'], b'fixture override')
+
+    def test_original_gate_failure_is_not_hidden_by_cleanup(self):
+        for stop_fail in (False, True):
+            with self.subTest(stop_fail=stop_fail):
+                result, _ = self.run_serve(stop_fail=stop_fail, autopilot_fail=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('error: inference failed', result.stdout)
+                self.assertIn('FAIL: autopilot not ok', result.stdout)
+                self.assertNotIn('Training serve: PASS', result.stdout)
+                if stop_fail:
+                    self.assertIn('original stop error', result.stderr)
+
+    def test_log_failure_remains_failure_even_if_cleanup_fails(self):
+        result, _ = self.run_serve(stop_fail=True, log_fail=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('original log error', result.stderr)
+        self.assertIn('original stop error', result.stderr)
+        self.assertNotIn('Training serve: PASS', result.stdout)
+
+    def test_skip_upload_does_not_clean_existing_resources(self):
+        result, files = self.run_serve(stop_fail=True, skip_upload=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Training serve: PASS', result.stdout)
+        self.assertNotIn('original stop error', result.stderr)
+        self.assertEqual(files['manifest.json'], b'{"models": ["user-model"]}')
+
+
 if __name__ == '__main__':
     unittest.main()
